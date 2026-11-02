@@ -29,4 +29,4 @@
 - **If a secret is already pushed:** `git rm --cached` isn't enough because it stays in history. Rotate the secret first (new key, remove the IP from the firewall), then optionally clean history with `git filter-repo`. Always check `git status` before committing.
 
 ### Questions I still have
--
+- Still work a little more on git fundamentals
