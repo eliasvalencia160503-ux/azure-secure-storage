@@ -9,5 +9,10 @@ terraform {
       # Pessimistic constraint: at least 5.12, any later 5.x, never 6.0.
       version = "~> 5.12"
     }
+    random = {
+      source = "hashicorp/random"
+      # Pessimistic constraint: at least 3.5, any later 3.x, never 4.0
+      version = "~> 3.5"
+    }
   }
 }
