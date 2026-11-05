@@ -96,7 +96,7 @@ Terraform is like a standard image or an Intune policy, but for cloud infrastruc
 
 ### Key concepts
 - **Storage account names** are globally unique across all of Azure, 3–24 characters, lowercase letters and numbers only. No hyphens, so `"${var.prefix}-sa"` can't work. That's why I need a random suffix.
-- **Adding a provider needs `init`:** _(my answer)_
+- **Adding a provider needs `init`:** because init is the only command that downloads plugins.
 - **The suffix doesn't change on a second apply:** the result is saved in state. It only changes if the `random_string` itself is replaced.
 - **Dependency graph:** the storage account's name references `random_string.suffix.result`, so Terraform creates the suffix first. I didn't have to declare the order. It's also why the name shows `(known after apply)` in the plan.
 - **Resource ID** = the full address of a resource, like a file path (or an AD distinguished name). A name like `securestg-rg` can exist in many subscriptions, but the ID can only mean one thing: `/subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<name>`. RBAC scopes use IDs, and access inherits down the path. That's why I'll scope my data role to the storage account and not the resource group (least privilege).
@@ -104,7 +104,7 @@ Terraform is like a standard image or an Intune policy, but for cloud infrastruc
 - **Control plane vs. data plane:** Owner manages the *resource* (settings, delete, roles). Reading blobs is data plane and needs *Storage Blob Data Reader/Contributor*. Owner normally "works" because it can run `listKeys` and the portal quietly uses the key. With Shared Key disabled, that's gone, so I got "You do not have permissions to list the data" on the Containers page.
 - **Replacement:** changing `infrastructure_encryption_enabled` (or the name) shows `-/+` with `# forces replacement`. Terraform deletes first, then creates, and the data is gone. It recreates the account with the same name because the suffix is still in state. Always stop and read `-/+` on anything that holds data.
 - **Soft delete vs. versioning:** soft delete protects against *deletes* (deleted blobs or containers are hidden and restorable for 7 days). Versioning protects against *overwrites*. Both live **inside** the account, like a USB drive's recycle bin, so `terraform destroy` wipes them too. Soft delete doesn't block `destroy`; resource locks, locked immutability policies and Key Vault purge protection do.
-- **A second `plan` showing "No changes" matters because:** _(my answer)_
+- **A second `plan` showing "No changes" matters because:** Because it proves the initial apply worked since there is no changes left.
 
 ### Mistakes I made & how I fixed them
 - Put `random = { ... }` **inside** the `azurerm = { ... }` object in `required_providers`. Each provider is its own entry; `terraform fmt` indentation showed it.
@@ -128,4 +128,4 @@ Terraform is like a standard image or an Intune policy, but for cloud infrastruc
   - Storage data-plane logs only exist if diagnostic settings are turned on.
 
 ### Questions I still have
--
+- 
