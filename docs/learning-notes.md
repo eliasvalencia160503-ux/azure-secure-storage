@@ -129,3 +129,48 @@ Terraform is like a standard image or an Intune policy, but for cloud infrastruc
 
 ### Questions I still have
 - 
+
+## Stage 3 – RBAC (data-plane access) and a private container
+**Date:** 2026-11-06
+
+### What I built
+- `data "azurerm_client_config" "current"`: reads who is running Terraform (creates nothing).
+- `azurerm_role_assignment.blob_contributor_me`: **Storage Blob Data Contributor**, scoped to the storage account's `.id`, given to my `object_id`.
+- `azurerm_storage_container.storage_cont`: `privatecont`, access type `"private"`, `depends_on` the role assignment.
+- Outputs: `object_id`, `storage_container_name`.
+
+### Key concepts
+- **Data source vs. resource:** a `data` block reads something that already exists, like my current Azure login, and never creates anything. Data sources are read during `plan`, so `principal_id` showed a real value. `scope` showed `(known after apply)` because Azure only assigns the storage account's ID when it creates the account.
+- **Principal / object ID:** a principal is any identity that can get a role (user, group, service principal, managed identity). The object ID is its GUID that never changes, like the objectGUID/SID in on-prem AD. My display name or UPN can change; the object ID can't, so RBAC stores the object ID.
+- **Why object ID and not tenant ID:** the tenant ID is the whole directory (like the domain), so it can't say *who* gets the role. The object ID is one identity in it.
+
+  | Question | Answer |
+  |---|---|
+  | Which organization? | `tenant_id` |
+  | Which subscription? | `subscription_id` |
+  | Which identity gets access? | `object_id` → `principal_id` |
+
+- **Role definition vs. role assignment:** a definition is the role itself (the list of permissions, like "Storage Blob Data Contributor"); an assignment gives that role to one principal at one scope.
+- **Scope must be the `.id`:** `.name` is just the short name. RBAC needs the full path (`/subscriptions/.../storageAccounts/...`) so it knows exactly which account. Scoping to the storage account and not the resource group = least privilege: I only get data access to this one account, not everything else in the resource group.
+- **Hidden dependencies and `depends_on`:** Terraform only sees order from references. The container uses no value from the role assignment; it only needs the *permission*, so I added `depends_on` because otherwise Terraform could create both at the same time and the container would fail with a 403. RBAC can still take 1–2 minutes to take effect, so a retry may be needed anyway.
+- **Order on apply:** RG + suffix (parallel) → storage account → role assignment → container.
+- **Later in CI:** `object_id` will be the pipeline's service principal, not me, so the role would go to the pipeline and I'd need a separate assignment for my own user if I still want portal access.
+
+### Mistakes I made & how I fixed them
+- Used `azurerm_role_definition` (creates a custom role) instead of `azurerm_role_assignment` (gives a role to someone).
+- Scope was `random_string.suffix.result`, then `.name`, then finally `.id`. `validate` passed with `.name` because it only checks that `scope` is a string, not that it's a real resource ID. It would only have failed at `apply`, after other resources were already created.
+- Made up the role name "Storage Blob Data Container". Role names must match exactly.
+- `private` without quotes, the same mistake as `TLS1_2` in Stage 2.
+- `private_cont`: underscores aren't allowed in container names (lowercase letters, numbers, hyphens).
+- Put an output in `main.tf` with no description. Outputs go in `outputs.tf`.
+
+### Break-fix challenge (Contributor → Reader)
+- **Predicted:** a 2nd assignment gets added, and Reader can't even list.
+- **What happened:** `-/+ replace` (`# forces replacement`). Listing worked; upload failed with 403 `AuthorizationPermissionMismatch`.
+- **Lessons:**
+  - Role assignments can't be edited in Azure, so changing the role deletes the old assignment and creates a new one. For a short time I had no data role at all.
+  - `~` vs `-/+` depends on what Azure allows to change on a live resource, not on how big the change looks.
+  - Reader = list and read blobs only; Contributor = read, write and delete. Least privilege means giving Reader to anything that only consumes data, and Contributor only to things that actually write.
+
+### Questions I still have
+- 

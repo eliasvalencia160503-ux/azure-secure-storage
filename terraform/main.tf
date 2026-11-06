@@ -38,3 +38,21 @@ resource "azurerm_storage_account" "storage" {
     }
   }
 }
+
+data "azurerm_client_config" "current" {
+}
+
+resource "azurerm_role_assignment" "blob_contributor_me" {
+  scope                = azurerm_storage_account.storage.id
+  role_definition_name = "Storage Blob Data Contributor"
+  principal_id         = data.azurerm_client_config.current.object_id
+}
+
+resource "azurerm_storage_container" "storage_cont" {
+  name                  = "privatecont"
+  storage_account_id    = azurerm_storage_account.storage.id
+  container_access_type = "private"
+
+
+  depends_on = [azurerm_role_assignment.blob_contributor_me]
+}
