@@ -173,4 +173,4 @@ Terraform is like a standard image or an Intune policy, but for cloud infrastruc
   - Reader = list and read blobs only; Contributor = read, write and delete. Least privilege means giving Reader to anything that only consumes data, and Contributor only to things that actually write.
 
 ### Questions I still have
-- 
+- none
