@@ -37,6 +37,12 @@ resource "azurerm_storage_account" "storage" {
       days = 7
     }
   }
+
+  network_rules {
+    default_action = "Deny"
+    ip_rules       = [var.my_public_ip]
+    bypass         = ["AzureServices"]
+  }
 }
 
 data "azurerm_client_config" "current" {

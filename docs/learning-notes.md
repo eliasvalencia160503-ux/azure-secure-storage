@@ -174,3 +174,47 @@ Terraform is like a standard image or an Intune policy, but for cloud infrastruc
 
 ### Questions I still have
 - none
+
+## Stage 4 – Storage firewall (network rules)
+**Date:** 2026-11-09
+
+### What I built
+- A `network_rules` block inside `azurerm_storage_account.storage` (inline, like `blob_properties`):
+  - `default_action = "Deny"`: anything that doesn't match a rule is blocked.
+  - `ip_rules = [var.my_public_ip]`: only my public IP is allowed.
+  - `bypass = ["AzureServices"]`: trusted Microsoft services (Backup, Monitor, etc.) can still get through.
+- `public_network_access_enabled` stays on. IP rules only apply to the public endpoint, so turning it off would lock everyone out (that's what Private Endpoints are for).
+- My real IP lives only in `terraform.tfvars` (gitignored), never in a `.tf` file.
+
+### Key concepts
+- **Two locks:** RBAC (Stage 3) checks *who I am*; the firewall checks *where I'm coming from*. Both have to pass. Someone with Storage Blob Data Contributor still gets a 403 from the wrong IP, because the firewall rejects the request before RBAC is even checked.
+- **The firewall allows an IP, not a device.** On a different network I have to update `my_public_ip` (`curl -s https://api.ipify.org`) and apply. Azure never updates the rule for me.
+- **Management plane vs. data plane (again):** the firewall only guards the data plane (`<account>.blob.core.windows.net`). Terraform changes settings through the management plane (`management.azure.com`), so even with the wrong IP, `terraform apply` still works and I can't lock Terraform out of fixing it. Same for the portal: Overview loads, Containers doesn't.
+- **`bypass` and least privilege:** `Metrics` and `Logging` are for classic Storage Analytics, which I don't use. I kept only `AzureServices`.
+- **`~` again:** adding firewall rules is an update in place, because Azure can change them on a live account.
+- **DNS error vs. firewall error:**
+  - `Failed to resolve ... getaddrinfo failed` = DNS. The account name doesn't exist, so the request never reached Azure.
+  - HTTP `403 AuthorizationFailure` = the request reached Azure and the firewall (or RBAC) rejected it.
+- **Saved plans:** `terraform plan -out=main.tfplan` then `terraform apply main.tfplan` applies exactly what I reviewed, with no new plan and no `yes` prompt. Plain `terraform apply` is fine when I review and apply right away; saved plans matter when time or people come between review and apply, like CI. A saved plan only works once.
+
+### Mistakes I made & how I fixed them
+- `ip_rules = var.my_public_ip`: `validate` said "set of string required, but have string". Wrapping it in brackets fixed it: `[var.my_public_ip]`. Variable references never take quotes.
+- Started with `bypass = ["Metrics", "Logging", "AzureServices"]`, which allows more than I need. Cut it down to `["AzureServices"]`.
+- Passed a GUID (one of my IDs) as `--account-name` and got a DNS error. Fixed by using `terraform output storage_account_name`. Storage account names never have hyphens, so a GUID can't be one.
+- Plan file naming: `.gitignore` has `*.tfplan`, so a file named just `tfplan` would **not** be ignored. Name plan files `something.tfplan`.
+
+### Break-fix challenge (wrong IP)
+- **Broke:** changed `my_public_ip` in `terraform.tfvars` to `203.0.113.10` (a documentation-only IP) and applied.
+- **Predicted:**
+  - a. Plan shows `~` update in place. ✅
+  - b. Apply succeeds. ✅ (management plane isn't behind the firewall)
+  - c. `az storage blob list --auth-mode login` returns 403. ✅
+  - d. Portal Overview works, Containers doesn't. ✅
+- **Fixed:** put my real IP back in `terraform.tfvars` and applied again; `blob list` worked.
+- **Lessons:**
+  - The firewall is checked before RBAC; a valid role doesn't help from the wrong network.
+  - Moving networks = update the variable and apply.
+  - The firewall protects data, not settings. Someone with Owner/Contributor on the management plane can still change the firewall, so who has management roles still matters.
+
+### Questions I still have
+- I am stil not 100% clear about the difference between management plane and data plane.
