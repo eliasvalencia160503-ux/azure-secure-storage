@@ -218,3 +218,63 @@ Terraform is like a standard image or an Intune policy, but for cloud infrastruc
 
 ### Questions I still have
 - I am stil not 100% clear about the difference between management plane and data plane.
+
+## Stage 5 – Catch-up: lifecycle rule, immutability (WORM), file share
+**Date:** 2026-11-09
+
+### Why this stage
+My original roadmap had a lifecycle rule in Stage 2 and immutability + a file share in Stage 3, but we skipped them. This stage catches up before moving on to networking (VNet / private endpoint) in Stage 6.
+
+### What I built
+- `azurerm_storage_management_policy.cleanup`: one rule, `autocleanup`, for block blobs only (`filters { blob_types = ["blockBlob"] }`):
+  - Move to **Cool** after 30 days without changes, **delete** after 365 days.
+  - Delete old **versions** after 90 days (versioning is on, so they'd pile up otherwise).
+- `azurerm_storage_container_immutability_policy.retention`: time-based retention on `privatecont`, **1 day**, `locked = false`.
+- `azurerm_storage_share.fileshare`: Azure Files share `sharefile`, `quota = 1` GB, using `storage_account_id`.
+- Output: `file_share_name`.
+- Plan: `3 to add, 0 to change, 0 to destroy`. Nothing existing was touched.
+
+### Key concepts
+- **Lifecycle management = cost control.** Data I don't touch moves to a cheaper tier automatically and is eventually deleted. It runs about once a day, not instantly.
+- **Immutability (WORM = write once, read many):** during retention, a blob can't be **deleted or overwritten** by anyone, not even Owner. It sits above RBAC.
+- **Locked vs. unlocked:**
+  - Unlocked: the policy can be edited or deleted. Good for testing.
+  - Locked: retention can only be **extended**, never shortened or removed. Protected blobs can't be deleted until retention ends, so `terraform destroy` would fail and I'd keep paying. Only lock it when compliance requires it.
+- **`protected_append_writes_enabled`:** allows adding to existing blobs while old data stays protected (for logs). I left it at the default (`false`).
+- **How the protections stack:**
+
+  | Protection | Stops | Weakness |
+  |---|---|---|
+  | RBAC | Unauthorized people | Anyone with the right role gets in |
+  | Soft delete | Permanent loss from deletes (7-day recycle bin) | Data still gets "deleted" |
+  | Versioning | Permanent loss from overwrites (old copy kept) | Old versions can be deleted |
+  | Immutability | Any change or delete during retention | Nothing, during retention. Good against ransomware or stolen admin creds |
+
+- **Azure Files and Shared Key:** Terraform created the share fine, because `storage_account_id` goes through the management plane (ARM), no key needed. *Using* the share is different:
+  - `az storage file upload` tries the account key by default, and I disabled keys.
+  - My **Blob** Data Contributor role doesn't cover files. Files have their own roles ("Storage File Data …"). Data roles are per service.
+  - Coming back to this in Stage 7 with the VM + managed identity.
+- **Destroy order is the reverse of create order.** The policy references the container, so Terraform creates the container first and deletes the policy first.
+- **PowerShell gotcha:** `terraform plan -out=main.tfplan` fails with "Too many command line arguments" because PowerShell splits `-flag=value` at the dot. Quote it: `terraform plan "-out=main.tfplan"`. Bash/Linux doesn't have this problem.
+- **Newline at end of file:** text files should end with a newline. Without it, Git shows `\ No newline at end of file` and diffs get messy. VS Code setting "insert final newline" adds it automatically.
+
+### Mistakes I made & how I fixed them
+- Lifecycle rule without a `filters` block: `validate` said "At least 1 filters blocks are required". Added `blob_types = ["blockBlob"]`.
+- Rule named `rule1`; renamed it `autocleanup` so it says what it does.
+- Spelled it **in**mutability (Spanish: *inmutabilidad*) in the resource type, the argument (also missing a letter) and the nickname. Copy names from the docs instead of typing them.
+- Lined up `=` signs by hand and was off by one space. Run `terraform fmt` before every check.
+- Forgot to save the file, so the reviewer saw nothing (same as Stage 1).
+- Tried the upload test against the **file share** instead of the blob **container**; the WORM policy is only on the container.
+- `[WinError 2] cannot find the file 'test.txt'`: `--file` is a file on *my computer*, and it didn't exist. Created it in `$env:TEMP` so it stays out of the repo.
+
+### Break-fix challenge (WORM)
+- **Test:** uploaded `test.txt` and tried to delete it → `This operation is not permitted as the blob is immutable due to a policy.` Even with Contributor.
+- **Prediction 1:** overwriting with `--overwrite` would work and create a new version. ❌ **Blocked.** WORM freezes the content; versioning only keeps old copies *when* an overwrite is allowed, and here it isn't.
+- **Prediction 2:** `terraform destroy` with a protected blob still inside would succeed. ✅ Terraform deleted the unlocked policy first, which released the blob, then removed the container, account and resource group. State ended up empty.
+- **Lessons:**
+  - Immutability blocks overwrites too, not just deletes.
+  - `locked = false` is what made destroy possible. A locked policy would have stopped the destroy partway.
+  - Always check which resource has a dependency on which; it decides the destroy order.
+
+### Questions I still have
+- none

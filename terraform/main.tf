@@ -62,3 +62,36 @@ resource "azurerm_storage_container" "storage_cont" {
 
   depends_on = [azurerm_role_assignment.blob_contributor_me]
 }
+
+resource "azurerm_storage_management_policy" "cleanup" {
+  storage_account_id = azurerm_storage_account.storage.id
+
+  rule {
+    name    = "autocleanup"
+    enabled = true
+    filters {
+      blob_types = ["blockBlob"]
+    }
+    actions {
+      base_blob {
+        tier_to_cool_after_days_since_modification_greater_than = 30
+        delete_after_days_since_modification_greater_than       = 365
+      }
+      version {
+        delete_after_days_since_creation = 90
+      }
+    }
+  }
+}
+
+resource "azurerm_storage_container_immutability_policy" "retention" {
+  storage_container_resource_manager_id = azurerm_storage_container.storage_cont.id
+  immutability_period_in_days           = 1
+  locked                                = false
+}
+
+resource "azurerm_storage_share" "fileshare" {
+  name               = "sharefile"
+  storage_account_id = azurerm_storage_account.storage.id
+  quota              = 1
+}

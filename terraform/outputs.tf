@@ -27,3 +27,8 @@ output "storage_container_name" {
   description = "Name of the storage container"
   value       = azurerm_storage_container.storage_cont.name
 }
+
+output "file_share_name" {
+  description = "Name of the Azure Files Share"
+  value       = azurerm_storage_share.fileshare.name
+}
