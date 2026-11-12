@@ -28,9 +28,6 @@
 - **Lesson:** `.gitignore` only affects **untracked** files. Once a file is staged or committed, ignore rules don't apply to it.
 - **If a secret is already pushed:** `git rm --cached` isn't enough because it stays in history. Rotate the secret first (new key, remove the IP from the firewall), then optionally clean history with `git filter-repo`. Always check `git status` before committing.
 
-### Questions I still have
-- Still work a little more on git fundamentals
-
 ## Stage 1 – Provider, resource group, variables, outputs
 **Date:** 2026-11-02
 
@@ -75,9 +72,6 @@ Terraform is like a standard image or an Intune policy, but for cloud infrastruc
   - Terraform only detects drift when I run it, and only on resources in its state.
   - If the portal change was intentional, update the code to match instead.
 - Be careful pasting `az` output publicly: the `id` field contains my subscription ID.
-
-### Questions I still have
-- Understand a little more about Terraform files, how to write them and understand them a little further.
 
 ## Stage 2 – Storage account
 **Date:** 2026-11-03
@@ -127,8 +121,6 @@ Terraform is like a standard image or an Intune policy, but for cloud infrastruc
   - Terraform only catches drift when I run it, so the back door was open until then. Azure Policy (deny/audit Shared Key access) closes that gap.
   - Storage data-plane logs only exist if diagnostic settings are turned on.
 
-### Questions I still have
-- 
 
 ## Stage 3 – RBAC (data-plane access) and a private container
 **Date:** 2026-11-06
@@ -172,8 +164,7 @@ Terraform is like a standard image or an Intune policy, but for cloud infrastruc
   - `~` vs `-/+` depends on what Azure allows to change on a live resource, not on how big the change looks.
   - Reader = list and read blobs only; Contributor = read, write and delete. Least privilege means giving Reader to anything that only consumes data, and Contributor only to things that actually write.
 
-### Questions I still have
-- none
+
 
 ## Stage 4 – Storage firewall (network rules)
 **Date:** 2026-11-09
@@ -216,8 +207,7 @@ Terraform is like a standard image or an Intune policy, but for cloud infrastruc
   - Moving networks = update the variable and apply.
   - The firewall protects data, not settings. Someone with Owner/Contributor on the management plane can still change the firewall, so who has management roles still matters.
 
-### Questions I still have
-- I am stil not 100% clear about the difference between management plane and data plane.
+
 
 ## Stage 5 – Catch-up: lifecycle rule, immutability (WORM), file share
 **Date:** 2026-11-09
@@ -276,5 +266,79 @@ My original roadmap had a lifecycle rule in Stage 2 and immutability + a file sh
   - `locked = false` is what made destroy possible. A locked policy would have stopped the destroy partway.
   - Always check which resource has a dependency on which; it decides the destroy order.
 
-### Questions I still have
-- none
+
+## Stage 6 – Private networking: VNet, service endpoint, private endpoint, private DNS
+**Date:** 2026-11-11
+
+### What I built
+- **6a – VNet + service endpoint**
+  - `azurerm_virtual_network.stvnet`: `10.0.0.0/16`.
+  - `azurerm_subnet.vm`: `10.0.1.0/24`, with a `service_endpoint { service = "Microsoft.Storage" }` block. This is for the Stage 7 VM.
+  - `azurerm_subnet.pe`: `10.0.2.0/24`, only for the private endpoint.
+  - Storage firewall: added `virtual_network_subnet_ids = [azurerm_subnet.vm.id]` to `network_rules`, and kept `ip_rules` so I don't lock myself out.
+- **6b – Private endpoint + private DNS**
+  - `azurerm_private_dns_zone.dnszone`: `privatelink.blob.core.windows.net`. The name has to be exactly this.
+  - `azurerm_private_dns_zone_virtual_network_link.vnetlink`: connects the zone to the VNet (`registration_enabled = false`).
+  - `azurerm_private_endpoint.pe`: in the `pe` subnet, pointing at the **storage account** with `subresource_names = ["blob"]`, `is_manual_connection = false`, plus a `private_dns_zone_group` that holds the zone ID.
+  - Outputs: `vnet_name`, `private_endpoint_ip`.
+- Plan from empty state: `14 to add` (8 from earlier stages + 3 for 6a + 3 for 6b). The `data` source isn't counted, because it only reads.
+- Result: `private_endpoint_ip = 10.0.2.4`. Azure reserves `.0`–`.3` in every subnet, so `.4` is the first free address.
+
+### Key concepts
+- **Management plane vs. data plane** (this answers my Stage 4 question):
+
+  | | Management plane | Data plane |
+  |---|---|---|
+  | What it does: Creates and configures resources | Reads and writes the data inside them 
+  | Endpoint | `management.azure.com` (ARM) | `<account>.blob.core.windows.net` |
+  | Who uses it | Terraform, portal, `az network …` | `az storage blob …`, apps, the VM |
+  | RBAC roles | Owner, Contributor | Storage Blob Data Contributor, Storage File Data … |
+  | Storage firewall applies? | No | Yes |
+
+  - The firewall, service endpoints and private endpoints only affect the **data plane**. Terraform keeps working no matter what I put in `network_rules`.
+- **Service endpoint vs. private endpoint:**
+
+  | | Service endpoint | Private endpoint |
+  |---|---|---|
+  | Storage IP | Stays **public** | Gets a **private** IP in my subnet (`10.0.2.4`) |
+  | How it works | Traffic from the subnet travels on Azure's backbone, and the firewall allows that subnet | A network card for the storage account sits in my subnet |
+  | DNS change | None | Needs the `privatelink` DNS zone |
+  | Cost | Free | Charged per hour + data |
+  | Works from on-prem / peered VNets | No | Yes |
+
+  - A subnet rule in the firewall only works if the subnet has the `Microsoft.Storage` service endpoint. Without it, Azure rejects the rule.
+  - Private endpoint traffic doesn't go through `ip_rules` / `virtual_network_subnet_ids`. An approved endpoint is allowed in by itself.
+- **The DNS chain:**
+  ```
+  <account>.blob.core.windows.net
+    └─ CNAME → <account>.privatelink.blob.core.windows.net
+                 └─ private zone A record → 10.0.2.4 (only inside the VNet)
+  ```
+  - The **VNet link** makes the whole VNet (every subnet) use the private zone. Without it the zone exists but nobody asks it anything.
+  - The **DNS zone group** makes Azure create the A record automatically (`creator="created by private endpoint securestg-pe"`). Without it the endpoint gets its IP but the name still resolves to the public IP. This is the most common private endpoint mistake.
+  - From my laptop, `nslookup` showed the `privatelink` alias but a **public** IP (`20.60.135.196`). My network's DNS (Google, 8.8.8.8) can't see the private zone.
+  - In Stage 7, the VM in the `vm` subnet will get `10.0.2.4`, so its blob traffic will go through the private endpoint, not the service endpoint.
+- **How Terraform picks a provider:** the resource type name up to the first `_`. `azurerm_subnet` → `azurerm`. A typo like `private_dns_…` makes it look for a provider called `private`.
+- **Nested blocks are lists.** To read a value from one I need an index: `azurerm_private_endpoint.pe.private_service_connection[0].private_ip_address`. Attributes (under **Attributes Reference** in the docs) are values Azure returns after creating the resource.
+- **`.id` vs. `.name`:** the firewall needs the subnet's full resource ID, because a name like `securestg-vm` could exist in many VNets.
+
+### Mistakes I made & how I fixed them
+- Used `service_endpoints = ["Microsoft.Storage"]` (a list, from older provider versions). In azurerm 5.x it's a **block**: `service_endpoint { service = "Microsoft.Storage" }`. Always check the docs for the version I'm actually using.
+- Renamed the subnet nicknames (`stsubnetvm` → `vm`) but forgot the reference in `network_rules` → `Reference to undeclared resource`. Renaming a resource means updating every reference to it.
+- Wrote the VNet link type as `private_dns_virtual_network_link` → `Missing required provider … hashicorp/private`. Missing the `azurerm_` prefix and the word `zone`. Copy type names from the docs.
+- Left the DNS zone name unquoted → Terraform read `privatelink.blob…` as a reference to a resource. Fixed text needs quotes.
+- Forgot `name` and `virtual_network_id` on the VNet link. A link needs both ends.
+- Thought `private_connection_resource_id` should be the DNS zone. It's the **storage account**. The DNS zone ID goes in `private_dns_zone_group`.
+- Missing newline at end of file (again) in `main.tf` and `outputs.tf`.
+- `az … record-set a list` said the required arguments were missing because the command got split onto two lines in PowerShell. Paste long commands as one line.
+
+### Break-fix challenge (firewall vs. private endpoint)
+- **Change:** removed my IP from `ip_rules` (kept the subnet rule and the private endpoint) and applied.
+- **Prediction 1:** `az storage blob list` from my laptop would be **blocked**. ✅ My laptop resolves to the public IP, and nothing allows that path now. The private endpoint only helps clients inside the VNet.
+- **Prediction 2:** `terraform plan` would still work. ✅ Terraform uses the management plane, and the storage firewall doesn't guard it.
+- **Catch:** I wasn't home, so my public IP was probably already different from `my_public_ip`. To prove the change caused the block, test one change at a time: put my current IP in, confirm it works, then remove it.
+- **Lessons:**
+  - A private endpoint is not a backdoor for me. It's a private door for things inside the VNet.
+  - Firewall rules only control the data plane.
+  - My public IP changes when I change networks, so the IP rule breaks when I'm away from home.
+

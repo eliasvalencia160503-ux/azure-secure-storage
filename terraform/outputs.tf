@@ -32,3 +32,13 @@ output "file_share_name" {
   description = "Name of the Azure Files Share"
   value       = azurerm_storage_share.fileshare.name
 }
+
+output "vnet_name" {
+  description = "Name of the Virtual Network"
+  value       = azurerm_virtual_network.stvnet.name
+}
+
+output "private_endpoint_ip" {
+  description = "Private IP of the blob private endpoint inside the pe subnet"
+  value       = azurerm_private_endpoint.pe.private_service_connection[0].private_ip_address
+}
