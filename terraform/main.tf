@@ -154,3 +154,62 @@ resource "azurerm_private_endpoint" "pe" {
     private_dns_zone_ids = [azurerm_private_dns_zone.dnszone.id]
   }
 }
+
+resource "azurerm_network_interface" "vmnic" {
+  name                = "${var.prefix}-nic"
+  location            = azurerm_resource_group.storage.location
+  resource_group_name = azurerm_resource_group.storage.name
+  tags                = var.tags
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.vm.id
+    private_ip_address_allocation = "Dynamic"
+  }
+}
+
+resource "azurerm_linux_virtual_machine" "linuxvm" {
+  name                = "${var.prefix}-linuxvm"
+  resource_group_name = azurerm_resource_group.storage.name
+  location            = azurerm_resource_group.storage.location
+  size                = "Standard_D2as_v4"
+  admin_username      = "adminuser"
+  tags                = var.tags
+
+  network_interface_ids = [
+    azurerm_network_interface.vmnic.id,
+  ]
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
+  }
+
+  admin_ssh_key {
+    username   = "adminuser"
+    public_key = file("~/.ssh/id_rsa.pub")
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts"
+    version   = "latest"
+  }
+
+  identity {
+    type = "SystemAssigned"
+  }
+}
+
+resource "azurerm_role_assignment" "vm_blob_data_reader" {
+  scope                = azurerm_storage_account.storage.id
+  role_definition_name = "Storage Blob Data Reader"
+  principal_id         = azurerm_linux_virtual_machine.linuxvm.identity[0].principal_id
+}
+
+resource "azurerm_role_assignment" "vm_storage_file_data" {
+  scope                = azurerm_storage_account.storage.id
+  role_definition_name = "Storage File Data Privileged Reader"
+  principal_id         = azurerm_linux_virtual_machine.linuxvm.identity[0].principal_id
+}

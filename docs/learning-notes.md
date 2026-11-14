@@ -342,3 +342,85 @@ My original roadmap had a lifecycle rule in Stage 2 and immutability + a file sh
   - Firewall rules only control the data plane.
   - My public IP changes when I change networks, so the IP rule breaks when I'm away from home.
 
+
+## Stage 7 – Test VM, managed identity, RBAC
+**Date:** 2026-11-14
+
+### What I built
+- `azurerm_network_interface.vmnic`: in the `vm` subnet, dynamic private IP, **no public IP** (on purpose).
+- `azurerm_linux_virtual_machine.linuxvm`: Ubuntu 22.04, `Standard_D2as_v4`, `os_disk` (`ReadWrite`, `Standard_LRS`), SSH public key from `~/.ssh/id_rsa.pub`, and `identity { type = "SystemAssigned" }`.
+- `azurerm_role_assignment.vm_blob_data_reader`: **Storage Blob Data Reader** on the storage account, for the VM's identity.
+- `azurerm_role_assignment.vm_storage_file_data`: **Storage File Data Privileged Reader** on the storage account, for the VM's identity.
+- Output: `linuxvm_name`.
+- Test scripts in `scripts/` (the start of Stage 8): `test-blob.sh` and `test-file.sh`. I ran them on the VM with `az vm run-command invoke … --scripts "@scripts/<file>.sh"`.
+
+### Key concepts
+- **Blocks vs. arguments:** an argument is `name = value`. A block is `name { … }` with no `=`, and it groups arguments (`os_disk`, `identity`, `ip_configuration`). The docs list required ones as **(Required)**.
+- **Managed identity:** an identity in Entra ID that Azure creates for the VM. There's no password or key I could leak. **System-assigned** means it belongs to this VM: it's created with it and deleted with it.
+- **Principal ID vs. resource ID:**
+
+  | | `.id` | `.identity[0].principal_id` |
+  |---|---|---|
+  | What it is | The VM's **address** in Azure | The VM's **identity** in Entra ID |
+  | Looks like | `/subscriptions/…/virtualMachines/…` | a GUID |
+  | Used for | Referencing the resource | **Giving it roles** |
+
+  - `identity` is a block, so it's a list → `[0]` picks the only item.
+  - `data.azurerm_client_config.current.object_id` is **me** (whoever runs Terraform), not the VM.
+- **IMDS (`169.254.169.254`):** a special address that only works from inside an Azure VM. The VM asks it for a token (`resource=https://storage.azure.com/`) and uses that token as `Authorization: Bearer …`. The token is a secret, so my script only prints its length.
+- **Run-command = management plane:** my PC sends the command to Azure's API, and the VM agent inside the VM picks it up and runs it. Nothing connects *into* the VM, so no public IP, SSH or Bastion is needed. (I got this wrong in the pre-apply quiz: it has nothing to do with the private endpoint.)
+- **Split-horizon DNS:** the same name gets different answers depending on where I ask from:
+
+  | Asked from | Answer |
+  |---|---|
+  | My PC (home DNS) | `57.150.26.33`, public |
+  | The VM (Azure DNS, via the VNet link) | `10.0.2.4`, the private endpoint |
+
+  - Both show the `privatelink` alias. Only the VNet can see my private zone, so only the VM stops at `10.0.2.4`.
+- **Blob and file take different paths:**
+
+  | | Blob | File |
+  |---|---|---|
+  | DNS answer from the VM | `10.0.2.4` (private) | Public IP |
+  | Why the firewall allows it | Private endpoint (skips the firewall) | Service endpoint + subnet rule in `network_rules` |
+
+- **Azure Files roles:**
+  - **SMB** roles (`Storage File Data SMB Share …`) are for mounting the share as a drive with AD / Kerberos identities. They don't work for the VM's managed identity calling the REST API.
+  - **Privileged** roles (`Storage File Data Privileged Reader/Contributor`) work with OAuth tokens over REST, but they bypass file/folder permissions. So:
+    - they're assigned at the **storage account** scope, which means the VM can read *every* share (less least-privilege than I'd like), and
+    - every request needs the header `x-ms-file-request-intent: backup`.
+- **400 vs. 401 vs. 403:**
+
+  | Code | Meaning | Type of problem |
+  |---|---|---|
+  | 400 Bad Request | The request is built wrong (e.g. a missing header) | Neither: Azure didn't get to checking who I am |
+  | 401 Unauthorized | Azure doesn't know who I am (no token / bad token) | **Authentication** |
+  | 403 Forbidden | Azure knows who I am, but no role allows it | **Authorization** |
+
+- **Quotas:** a VM needs **both** of these:
+  1. The size is **offered** in that region → `az vm list-skus --location eastus --size <name>`
+  2. My subscription has **quota** for that VM family in that region → `az vm list-usage --location eastus`
+  - Quotas are per subscription, per region, per VM family. New subscriptions often get 0 for newer families.
+
+### Mistakes I made & how I fixed them
+- The VM was missing `os_disk`, an image (`source_image_reference`) and `identity`. Validate caught `os_disk`. It didn't catch the missing identity, but nothing could get a role without it.
+- `file("~/.ssh/id_rsa.pub")` failed because I had no SSH key yet → `ssh-keygen -t rsa -b 4096`. The private key stays in `~/.ssh`, outside the repo.
+- Used `data.azurerm_client_config.current.object.id`: a typo (`object.id` instead of `object_id`), and also the wrong identity (me, not the VM).
+- Then used `azurerm_linux_virtual_machine.linuxvm.id`. **Validate said Success**, but that's the resource ID, not the principal ID. It would have failed at apply. Validate only checks that a value exists, not that it's the right one.
+- Role names: `"Storage File Data"` and `"Storage File Data SMB Privileged Reader"` don't exist, and `"…SMB Share Reader"` was the wrong kind. Validate can't check role names, so copy them from `az role definition list`.
+- **Quota error (409):** `Standard_B2ats_v2` → `standardBasv2Family` limit was **0**. All three B v2 families were 0, and the old `B1s`/`B2s` sizes aren't offered in eastus anymore. Switched to `Standard_D2as_v4` (DASv4 family, 10 cores of quota).
+- Thought the file test failed because `file.core.windows.net` had no private endpoint/DNS. It didn't need one: it resolves publicly and the service endpoint lets it through. The real error was `MissingRequiredHeader` → `x-ms-file-request-intent`.
+- Wrote the header as `-H "http: backup"\`. The header name comes from `<HeaderName>` in the error, and the `\` needs a space before it.
+
+### Break-fix challenge (RBAC removed)
+- **Change:** commented out `vm_blob_data_reader` and applied (1 to destroy), then ran `test-blob.sh` again.
+- **Prediction:** 400, because the VM needs the role to read the blob. The reasoning was right, but the code was wrong.
+- **Result:** `Token length: 2074`, then **`HTTP 403 AuthorizationPermissionMismatch`**.
+  - The token still worked: the identity exists, so **authentication** passed.
+  - No role allowed reading blobs, so **authorization** failed → 403.
+  - 400 would mean the request itself was malformed, like the missing header in the file test.
+- **Fix:** removed the `#`s, applied (1 to add), waited for the role to spread, then got 200 again.
+- **Lessons:**
+  - Removing a role doesn't break the identity, only what it's allowed to do.
+  - Role changes can take a few minutes (up to about 10) to reach Storage.
+  - Read the error **code** first: 400 = fix the request, 401 = fix the identity/token, 403 = fix RBAC.

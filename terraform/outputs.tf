@@ -42,3 +42,8 @@ output "private_endpoint_ip" {
   description = "Private IP of the blob private endpoint inside the pe subnet"
   value       = azurerm_private_endpoint.pe.private_service_connection[0].private_ip_address
 }
+
+output "linuxvm_name" {
+  description = "Name of the Linux VM"
+  value       = azurerm_linux_virtual_machine.linuxvm.name
+}
