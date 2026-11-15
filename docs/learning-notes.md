@@ -424,3 +424,82 @@ My original roadmap had a lifecycle rule in Stage 2 and immutability + a file sh
   - Removing a role doesn't break the identity, only what it's allowed to do.
   - Role changes can take a few minutes (up to about 10) to reach Storage.
   - Read the error **code** first: 400 = fix the request, 401 = fix the identity/token, 403 = fix RBAC.
+  
+
+## Stage 8 – Validation scripts
+**Date:** 2026-11-14
+
+### What I built
+- `scripts/validate-config.ps1` (laptop, **management plane**): 5 checks with `az storage account show --query … -o tsv`. Each prints PASS/FAIL:
+  - `minimumTlsVersion` = `TLS1_2`
+  - `enableHttpsTrafficOnly` = `true`
+  - `allowSharedKeyAccess` = `false`
+  - `allowBlobPublicAccess` = `false`
+  - `networkRuleSet.defaultAction` = `Deny`
+- `scripts/test-blob.sh` (VM): takes the account name as `$1`. It checks that the blob hostname resolves to the private endpoint (`10.0.2.4`), then lists blobs with the managed identity token. PASS/FAIL comes from the HTTP code.
+- `scripts/test-file.sh` (VM): the same idea for the file share (no DNS check, because there's no private endpoint for files).
+- `scripts/test-negative.ps1` (laptop, **data plane**): proves the blocked things really fail:
+  - an anonymous request → `PublicAccessNotPermitted`
+  - an account-key request (`--auth-mode key`) → `KeyBasedAuthenticationNotPermitted`
+- Run the VM scripts with:
+  `az vm run-command invoke -g <rg> -n <vm> --command-id RunShellScript --scripts "@scripts/test-blob.sh" --parameters <account>`
+
+### Key concepts
+- **Config check vs. behavior test:**
+  - A config check asks "is the lock set to locked?"
+  - A behavior test tries the door handle.
+  - I need both. A setting can look right while the real request behaves differently (my IP changed and the firewall blocked me, but `validate-config` still said PASS).
+- **Negative tests:** a PASS means the request was **blocked**. Match the error **code text**, not only the status number, because different layers can return similar numbers.
+- **Never hardcode things that change:** the account name has a random suffix.
+  - PowerShell: `terraform -chdir=terraform output -raw <output_name>`
+  - bash: the argument `$1` (`ACCOUNT=$1`)
+- **`terraform output` takes the output's *name*** (the label in `outputs.tf`), not its value.
+- **Always print the real value on FAIL.** A typo in `--query` returns an *empty* value, not an error, so a guessed message like "key is enabled" would lie.
+- **Every possible result gets a branch:** I added a final `else` so codes like 400 or `000` (no response) don't print nothing.
+- **Which layer said no:**
+
+  | Test | Layer that stopped it | Result |
+  |---|---|---|
+  | Laptop, IP not allowed | Network: the firewall | 403 `AuthorizationFailure` |
+  | Laptop, IP allowed, no token | Identity: anonymous access off | 409 `PublicAccessNotPermitted` |
+  | Laptop, account key | Identity: shared key off | `KeyBasedAuthenticationNotPermitted` |
+  | VM, token, no role (Stage 7) | Authorization: RBAC | 403 `AuthorizationPermissionMismatch` |
+
+- **Owner ≠ key access:** as Owner I can *fetch* the key (management plane, `listKeys`). When `shared_access_key_enabled = false`, the data plane refuses every key-signed request anyway. A leaked key is useless.
+- **The DNS chain** (`getent hosts`): `<acct>.blob.core.windows.net` → CNAME `<acct>.privatelink.blob.core.windows.net` → `10.0.2.4`, answered by my private DNS zone.
+- **Syntax I learned:**
+
+  | | PowerShell | bash |
+  |---|---|---|
+  | Variable | `$x = …` | `X=…` (no spaces, no `$` on the left) |
+  | Compare | `-eq`, `-match` | `[ "$X" = "200" ]` (spaces inside `[ ]` are required) |
+  | Else-if | `elseif` | `elif` |
+  | End of if | `}` | `fi` |
+  | Newline | `` `n `` | `\n` |
+
+  - `$( … )` saves a command's output. With curl, `-o /dev/null -w "%{http_code}"` returns only the status code.
+  - `2>&1` sends errors (stream 2) into normal output (stream 1), so a variable also captures the error text.
+  - On Windows, write `curl.exe`, not `curl`. In older PowerShell, `curl` is a nickname for `Invoke-WebRequest`.
+
+### Mistakes I made & how I fixed them
+- Typed `minumumTlsVersion`, which printed nothing (no error) → compared the name with the JSON.
+- Ran `terraform output -raw securestgnz048rnp`, which uses the value instead of the output name → "Output not found".
+- Created `$resourcegroup` but used `$resource_group_name` → an empty `-g` → "expected one argument".
+- After a new apply, `getent` returned nothing: the old account name no longer existed → pass the current name in.
+- bash: `else if` instead of `elif` (each `if` needs its own `fi`), and `["$STATUS"` without a space (`[` is a command).
+- `test-file.sh`: kept the old `-w "\nHTTP status…"`, so `STATUS` held the whole XML and never matched `200`. Then a missing opening `"` and a leftover `\n` broke the quotes.
+- The first anonymous test gave 403 `AuthorizationFailure`. That was the **firewall**: my home IP had changed. I updated `my_public_ip` in `terraform.tfvars` (git-ignored) and applied (in-place `~`). After that I got the real `PublicAccessNotPermitted`.
+- Predicted that Owner could list containers with the key. It can't: key auth is turned off on the account.
+
+### Break-fix challenge (shared key turned back on)
+- **Change:** `shared_access_key_enabled = true` and applied (in-place).
+- **Prediction:** one check fails in each script. ✅ Correct.
+- **Result:**
+  - `validate-config.ps1` → `FAIL: shared access key is true` (the **setting** is wrong)
+  - `test-negative.ps1` test 2 → FAIL with a list of containers (the **behavior** is wrong: key access actually worked)
+  - all other checks still PASS
+- **Fix:** set it back to `false`, applied, and everything passed again.
+- **Lessons:**
+  - Each check covers one thing, so one mistake only trips the checks for that thing.
+  - The config check and the behavior test caught the same hole from two sides.
+  - Without the scripts, nothing would have told me the account accepted keys again.
