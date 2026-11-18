@@ -22,7 +22,7 @@ resource "azurerm_storage_account" "storage" {
   location                          = azurerm_resource_group.storage.location
   account_tier                      = "Standard"
   account_replication_type          = "LRS"
-  min_tls_version                   = "TLS1_2"
+  min_tls_version                   = "TLS1_0"
   https_traffic_only_enabled        = true
   shared_access_key_enabled         = false
   default_to_oauth_authentication   = true
