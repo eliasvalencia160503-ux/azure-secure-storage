@@ -17,7 +17,10 @@ jobs:
                 terraform_version: "1.16.6"
             - name: Terraform FMT
               run: terraform fmt -check -recursive
-                 
+            - name: Terraform init
+              run: terraform init -backend=false
+            - name: Terraform validate
+              run: terraform validate   
 
 
 
