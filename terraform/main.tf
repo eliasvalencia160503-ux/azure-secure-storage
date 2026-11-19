@@ -14,7 +14,7 @@ resource "random_string" "suffix" {
 
 resource "azurerm_storage_account" "storage" {
   #checkov:skip=CKV_AZURE_59:Lab needs public access enabled since I am using ip rules to reach the storage through my public ip.
-  #checkov:skip=CKV_AZURE_206:Lab only using disposable test data, destroyed each session; LRS is enough and has no cost.
+  #checkov:skip=CKV_AZURE_206:Lab only using disposable test data, destroyed each session; LRS is enough and has less cost.
   #checkov:skip=CKV_AZURE_33:Lab does not use queues, therefore it is not needed.
   #checkov:skip=CKV2_AZURE_1:Lab already had double encryption with Microsoft-Managed keys and infrastructure_encryption_enabled, I would need Azure Key Vault for CMK.
   name                              = "${var.prefix}${random_string.suffix.result}"

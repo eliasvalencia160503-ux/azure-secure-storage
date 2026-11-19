@@ -503,3 +503,80 @@ My original roadmap had a lifecycle rule in Stage 2 and immutability + a file sh
   - Each check covers one thing, so one mistake only trips the checks for that thing.
   - The config check and the behavior test caught the same hole from two sides.
   - Without the scripts, nothing would have told me the account accepted keys again.
+
+## Stage 9a – CI: static checks with GitHub Actions
+
+### Why this stage
+CI (continuous integration) checks every change automatically before it reaches `main`. 9a uses only checks that need **no Azure login and no state**. 9b adds `plan` (OIDC + remote state). 9c adds CD (`apply` on merge, behind an approval).
+
+### What I built
+- `.github/workflows/terraform-ci.yml`. It runs on every pull request and on every push to `main`.
+- One job, `terraform`, on `ubuntu-latest`. `defaults: run: working-directory: terraform`.
+- Steps, in order:
+  1. `actions/checkout`: copies my repo onto the empty runner.
+  2. `hashicorp/setup-terraform`: installs Terraform `1.16.6`, the same version as my laptop.
+  3. `terraform fmt -check -recursive`: fails if any file isn't formatted.
+  4. `terraform init -backend=false`: downloads the providers from my committed `.terraform.lock.hcl`, without setting up state.
+  5. `terraform validate`: checks the config is valid: arguments, references, types, allowed values.
+  6. `bridgecrewio/checkov-action` (`directory: terraform/`, `framework: terraform`): security scan.
+- Worked on a branch (`stage-9a-ci`) and a pull request instead of committing straight to `main`.
+- Fixes CI forced on my Terraform:
+  - SSH key: `file("~/.ssh/id_rsa.pub")` → `var.ssh_public_key`. The value is in `terraform.tfvars` (git-ignored), with a placeholder in `.example`.
+  - An NSG for each subnet (`vmnsg`, `pensg`) plus `azurerm_subnet_network_security_group_association` for each.
+  - 6 inline `#checkov:skip` comments, each with a reason.
+
+### Key concepts
+- **PR (pull request):** a request to merge my branch into `main`. CI runs on it and shows ✅/❌ before I merge.
+- **OIDC:** GitHub proves "I am a run of this repo/branch" with a short-lived signed token, and Azure trades it for a short-lived access token. There's no stored secret. It's the same idea as the VM's managed identity. (Built in 9b.)
+- **Workflow structure:** `on` (when) → `jobs` (each one is a fresh VM) → `steps` (run top to bottom, stop at the first failure).
+- **`uses:` vs `run:`:**
+  - `uses:` runs a published action, like a module.
+  - `run:` runs a shell command.
+  - `defaults: run: working-directory` only applies to `run:` steps. That's why Checkov needs `directory: terraform/` itself.
+- **The runner is a blank, throwaway machine.** Anything that works "because it's on my laptop" breaks there: files in `~`, local state, my `az login`.
+- **`-backend=false`:** static checks don't need state. Once 9b adds an Azure backend, a plain `init` would try to log in.
+- **`validate` doesn't need variable values.** Values only matter at `plan`/`apply`.
+- **`fmt -check` only reports.** CI runs on a throwaway copy, so fixing there is pointless, and a bot pushing to my branch is messy. Fix locally (`terraform fmt`, or format-on-save in VS Code). CI is a **gate, not an editor**.
+- **YAML:** indentation = nesting; spaces only; siblings line up. A list item starts with `- `. In a list item with several keys, the other keys line up under the first key, not under the dash. A line at column 0 is top level: my misplaced `name:` became a second workflow name.
+- **Checkov findings: fix or skip with a reason.**
+  - Inline `#checkov:skip=ID:reason` only covers that one resource, and the reason lives next to the code.
+  - A global `skip_check` or `soft_fail: true` would hide future problems too.
+  - A good reason says why the risk is OK **here** and what still protects me.
+- **My 8 findings (23 passed):**
+
+  | Check | Decision | Why |
+  |---|---|---|
+  | CKV2_AZURE_31 ×2: subnet without NSG | **Fixed** | Real gap, cheap to fix |
+  | CKV_AZURE_59: public network access on | Skipped | My laptop uses `ip_rules`, which need public access; `default_action = "Deny"` |
+  | CKV_AZURE_206: no geo-replication | Skipped | Disposable lab data; GRS costs more |
+  | CKV2_AZURE_1: no customer-managed key | Skipped | Needs Key Vault; already Microsoft-managed keys + infrastructure (double) encryption |
+  | CKV_AZURE_33: queue logging | Skipped | No queues used; monitoring out of scope |
+  | CKV2_AZURE_21: blob read logging | Skipped | Monitoring out of scope (would enable in production) |
+  | CKV_AZURE_50: VM extensions allowed | Skipped | Run-command (my test scripts) works through a VM extension |
+
+- **NSG default rules** (priorities 65000–65500; my own rules go in 100–4096; lowest number wins, first match stops):
+  - Inbound: allow VNet, allow Azure Load Balancer, **deny everything else** (the internet can't start a connection to my VM).
+  - Outbound: allow VNet, **allow Internet**, deny the rest.
+  - **Stateful:** replies to an allowed connection come back automatically.
+  - So VM → private endpoint (VNet to VNet) and run-command (outbound) still work with no custom rules.
+  - Removing only the association leaves the NSG existing but detached.
+- **CI vs CD:** CI checks the change; CD deploys it. Without branch protection, CI only **reports**: GitHub still lets me merge a red PR ("Some checks were not successful" is a warning).
+
+### Mistakes I made & how I fixed them
+- The file showed red squiggles: a workflow must have `jobs:`, which I hadn't written yet.
+- Put the fmt step at column 0, so YAML read it as a second top-level `name:` → indented it as a `- name:` list item under `steps:`.
+- CI `validate` failed: `no file exists at "~/.ssh/id_rsa.pub"` on the runner → moved the key to a variable.
+- Pasted only the middle of the public key (`AAAA…`) → "not a complete SSH2 Public Key". A key is `ssh-rsa <data> <comment>`, so copy the whole line (`Get-Content $HOME\.ssh\id_rsa.pub | Set-Clipboard`). Windows opens `.pub` as a Publisher file, so open it from PowerShell or Notepad.
+- My new variable block wasn't formatted, and the CI fmt check would have caught it → `terraform fmt` before committing.
+
+### Break-fix challenge (insecure change on a PR)
+- **Try 1:** `min_tls_version = "TLS1_0"` → failed at **validate**, not Checkov: `expected min_tls_version to be one of ["TLS1_2"]`.
+  - Azure retired TLS 1.0/1.1 for Storage, so azurerm 5.x only allows TLS1_2.
+  - Checkov never ran, because steps stop at the first failure.
+- **Try 2:** `allow_nested_items_to_be_public = true` (a valid value) → validate passed, and **Checkov failed with 2 checks**. Rules overlap: one bad setting can trip several.
+- Reverted → ✅ again.
+- **Could I still merge while red?** Yes. `main` has no branch protection, so the grey button was only a warning. A required status check (9c) turns it into a real gate.
+- **Lessons:**
+  - Layers: the provider blocks some bad values and the scanner catches others.
+  - Cheap checks first.
+  - A check only protects `main` if it's required.
