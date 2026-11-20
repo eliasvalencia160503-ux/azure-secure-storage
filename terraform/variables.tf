@@ -30,3 +30,8 @@ variable "my_public_ip" {
   type        = string
   description = "My public IP, temporarily allowed through the storage firewall for testing"
 }
+
+variable "ssh_public_key" {
+  type        = string
+  description = "My public SSH key"
+}
