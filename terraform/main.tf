@@ -13,6 +13,10 @@ resource "random_string" "suffix" {
 }
 
 resource "azurerm_storage_account" "storage" {
+  #checkov:skip=CKV_AZURE_59:Lab needs public access enabled since I am using ip rules to reach the storage through my public ip.
+  #checkov:skip=CKV_AZURE_206:Lab only using disposable test data, destroyed each session; LRS is enough and has less cost.
+  #checkov:skip=CKV_AZURE_33:Lab does not use queues, therefore it is not needed.
+  #checkov:skip=CKV2_AZURE_1:Lab already had double encryption with Microsoft-Managed keys and infrastructure_encryption_enabled, I would need Azure Key Vault for CMK.
   name                              = "${var.prefix}${random_string.suffix.result}"
   resource_group_name               = azurerm_resource_group.storage.name
   location                          = azurerm_resource_group.storage.location
@@ -56,6 +60,7 @@ resource "azurerm_role_assignment" "blob_contributor_me" {
 }
 
 resource "azurerm_storage_container" "storage_cont" {
+  #checkov:skip=CKV2_AZURE_21:Monitoring and diagnostic logs were not included in this lab
   name                  = "privatecont"
   storage_account_id    = azurerm_storage_account.storage.id
   container_access_type = "private"
@@ -116,11 +121,35 @@ resource "azurerm_subnet" "vm" {
   }
 }
 
+resource "azurerm_network_security_group" "vmnsg" {
+  name                = "${var.prefix}-vmnsg"
+  resource_group_name = azurerm_resource_group.storage.name
+  location            = azurerm_resource_group.storage.location
+  tags                = var.tags
+}
+
+resource "azurerm_subnet_network_security_group_association" "vmnsgasso" {
+  subnet_id                 = azurerm_subnet.vm.id
+  network_security_group_id = azurerm_network_security_group.vmnsg.id
+}
+
 resource "azurerm_subnet" "pe" {
   name                 = "${var.prefix}-pe"
   resource_group_name  = azurerm_resource_group.storage.name
   virtual_network_name = azurerm_virtual_network.stvnet.name
   address_prefixes     = ["10.0.2.0/24"]
+}
+
+resource "azurerm_network_security_group" "pensg" {
+  name                = "${var.prefix}-pensg"
+  resource_group_name = azurerm_resource_group.storage.name
+  location            = azurerm_resource_group.storage.location
+  tags                = var.tags
+}
+
+resource "azurerm_subnet_network_security_group_association" "pensgasso" {
+  subnet_id                 = azurerm_subnet.pe.id
+  network_security_group_id = azurerm_network_security_group.pensg.id
 }
 
 resource "azurerm_private_dns_zone" "dnszone" {
@@ -169,6 +198,7 @@ resource "azurerm_network_interface" "vmnic" {
 }
 
 resource "azurerm_linux_virtual_machine" "linuxvm" {
+  #checkov:skip=CKV_AZURE_50:No extensions declared; extension operations must stay enabled because run-command (used by the Stage 7/8 test scripts) works through a VM extension.
   name                = "${var.prefix}-linuxvm"
   resource_group_name = azurerm_resource_group.storage.name
   location            = azurerm_resource_group.storage.location
@@ -187,7 +217,7 @@ resource "azurerm_linux_virtual_machine" "linuxvm" {
 
   admin_ssh_key {
     username   = "adminuser"
-    public_key = file("~/.ssh/id_rsa.pub")
+    public_key = var.ssh_public_key
   }
 
   source_image_reference {
