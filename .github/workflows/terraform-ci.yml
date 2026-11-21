@@ -16,15 +16,22 @@ jobs:
               with:
                 terraform_version: "1.16.6"
             - name: Terraform FMT
+              working-directory: .
               run: terraform fmt -check -recursive
             - name: Terraform init
               run: terraform init -backend=false
             - name: Terraform validate
+              run: terraform validate
+            - name: Bootstrap init
+              working-directory: bootstrap
+              run: terraform init -backend=false
+            - name: Bootstrap validate
+              working-directory: bootstrap
               run: terraform validate  
             - name: Checkov security scan
               uses: bridgecrewio/checkov-action@v12
               with:
-                directory: terraform/
+                directory: .
                 framework: terraform
     plan:
         needs: terraform
@@ -53,15 +60,4 @@ jobs:
           - name: Terraform init (remote state)
             run: terraform init -input=false
           - name: Terraform plan
-            run: terraform plan -input=false
-
-
-    
-
-
-
-
-
-    
-
-    
+            run: terraform plan -input=false    
