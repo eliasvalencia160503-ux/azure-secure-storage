@@ -23,6 +23,7 @@ resource "azurerm_storage_account" "tfstate" {
   #checkov:skip=CKV_AZURE_35:Same as CKV_AZURE_59: no IP allow-list possible for GitHub runners; access requires Entra ID + RBAC, keys and anonymous access disabled.
   #checkov:skip=CKV_AZURE_206:Holds only a few-KB lab state file; tracked resources are in the same region, so a geo copy adds little. Bad applies and deletes covered by versioning, 7-day soft delete and prevent_destroy.
   #checkov:skip=CKV2_AZURE_33:GitHub-hosted runners are outside any VNet, so a private endpoint would cut CI off from the state; protected by identity instead: shared keys off, no anonymous access, Entra ID + RBAC data role required
+  #checkov:skip=CKV_AZURE_249:False positive: rule's owner/repo regex predates GitHub's ID-based subject (owner@id/repo@id); subject is pinned to this repo by immutable IDs, no wildcards, pull_request only
   name                              = "sttfstate${random_string.suffix.result}"
   resource_group_name               = azurerm_resource_group.tfstate.name
   location                          = azurerm_resource_group.tfstate.location
