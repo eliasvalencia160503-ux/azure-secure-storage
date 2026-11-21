@@ -81,7 +81,7 @@ resource "azuread_application_federated_identity_credential" "github_pr" {
   display_name   = "github-pull-requests"
   issuer         = "https://token.actions.githubusercontent.com"
   audiences      = ["api://AzureADTokenExchange"]
-  subject        = "repo:eliasvalencia160503-ux/azure-secure-storage:pull_request"
+  subject        = "repo:eliasvalencia160503-ux@268777861/azure-secure-storage@1442441784:pull_request"
 }
 
 resource "azurerm_role_assignment" "github_reader" {
