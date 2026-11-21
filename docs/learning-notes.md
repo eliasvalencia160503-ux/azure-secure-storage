@@ -580,3 +580,111 @@ CI (continuous integration) checks every change automatically before it reaches 
   - Layers: the provider blocks some bad values and the scanner catches others.
   - Cheap checks first.
   - A check only protects `main` if it's required.
+
+## Stage 9b – Remote state, GitHub OIDC login, `plan` in CI
+
+### Why this stage
+CI couldn't run `terraform plan`, because:
+1. the state file lived only on my laptop;
+2. GitHub had no way to log in to Azure.
+
+9b fixes both with **remote state** and **OIDC**, which means no stored passwords.
+
+### What I built
+- **`bootstrap/`**, a separate small Terraform config with its own **local** state (git-ignored, backed up outside the repo). It's never destroyed:
+  - RG `securestg-tfstate-rg`, storage account `sttfstate<random>`, private container `tfstate`.
+    - Hardened like the main account: no shared keys, no public blobs, TLS 1.2, HTTPS only, infrastructure encryption.
+    - Versioning + 7-day soft delete, so a bad state can be rolled back.
+    - `lifecycle { prevent_destroy = true }`
+  - Me: **Storage Blob Data Contributor** on the account.
+  - **`azuread` provider**:
+    - app registration `github-azure-secure-storage-ci`
+    - service principal
+    - federated credential `github_pr`, which trusts only my repo's pull requests
+  - The CI identity:
+    - **Reader** on the subscription
+    - **Storage Blob Data Contributor** on the `tfstate` **container** only
+- **`terraform/backend.tf`**: `backend "azurerm"` with the account, the container, `key = "securestg.tfstate"` and `use_azuread_auth = true`. Moved my state with `terraform init -migrate-state`.
+- **GitHub settings**:
+  - Secrets: `AZURE_SUBSCRIPTION_ID`, `MY_PUBLIC_IP`
+  - Variables: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `SSH_PUBLIC_KEY`
+- **Workflow**:
+  - New `plan` job: `needs: terraform`, runs on PRs only, `permissions: id-token: write`. It logs in with `ARM_*` env vars, fills my variables with `TF_VAR_*`, then runs `init` (real backend) and `plan -input=false`.
+  - Job 1 now also checks `bootstrap/`: fmt from the repo root, bootstrap init/validate, and Checkov on `.`.
+- First CI plan: `Plan: 22 to add` (nothing deployed). Every PR now shows a real plan.
+
+### Key concepts
+- **State = Terraform's memory.** It maps my code to real Azure IDs. Without it, Terraform would try to create everything again.
+- **Remote state:**
+  - **Shared**: my laptop and CI read the same file.
+  - **Safe**: versioning keeps every old copy, and soft delete undoes deletes.
+  - **Locked**: Terraform takes a **blob lease** before each run, so two runs can't write at once. That's why even `plan` needs **write** access to the state.
+- **The state contains secrets in plain text** (IPs, keys, IDs). That's why the state account gets the same hardening as the data account.
+- **Bootstrap / chicken-and-egg:** a config can't create the place where its own state lives, and `destroy` must never delete it. So it goes in a separate config with local state, and `prevent_destroy` (destroy fails with an error, nothing gets deleted).
+- **Backend blocks can't use variables**: they're read during `init`, before variables exist. The names aren't secrets, so committing them is fine.
+- **No login method in `backend.tf`.** Locally, Terraform uses my `az login`. In CI, `ARM_USE_OIDC` and the other `ARM_*` env vars switch it to OIDC. The same files work in both places.
+- **Two providers:**
+  - `azurerm` = Azure resources (Resource Manager).
+  - `azuread` = Entra ID objects (Microsoft Graph).
+  - Entra ID is the tenant-level directory. Subscriptions sit under it.
+- **App registration vs service principal vs federated credential:**
+  - The **app registration** is the definition. It has two IDs: `id` (the object ID) and `client_id` (the application ID). `application_id` in the federated credential takes the object ID (`id`); the service principal's `client_id` takes `client_id`.
+  - The **service principal** is the app's instance in my tenant. **RBAC roles go to its `object_id`.**
+  - The **federated credential** is the trust rule (issuer + audience + **subject**). It replaces a password.
+- **OIDC flow:**
+  1. GitHub gives the job a short-lived signed token: "I am a PR run of this repo".
+  2. Entra ID checks the issuer, the audience and an **exact** subject match.
+  3. It returns an Azure token that lasts minutes.
+  4. There's no secret to leak or rotate. Same idea as the VM's managed identity.
+- **GitHub's subject is now ID-based:** `repo:owner@<ownerId>/repo@<repoId>:pull_request`.
+  - Names can be renamed or re-registered by someone else ("repojacking"). IDs never change and are never reused.
+  - Trust what can't change: same reason RBAC uses object IDs, not display names.
+- **Least privilege for CI:**
+  - Reader at the **subscription**, because my main RG is destroyed and recreated each session, so a role on it would vanish.
+  - Blob data role on **one container**, not the whole account.
+- **`TF_VAR_<name>`** fills `var.<name>`. The name must match `variables.tf` exactly. `-input=false` makes Terraform fail instead of waiting for someone to type.
+- **Secrets vs variables (GitHub):**
+  - Secrets are write-only and masked as `***` in logs.
+  - Variables are visible.
+  - My repo is public, so the IP and subscription ID are secrets.
+  - Fork PRs get no secrets and no OIDC token.
+- **Step-level `working-directory` overrides the job default.** Changing the *job* default to `.` made init/validate silently check nothing, and the job stayed green.
+- **Checkov findings for `bootstrap/`:**
+  - CKV_AZURE_59/35 and CKV2_AZURE_33 (public access, no firewall, no private endpoint): skipped. GitHub-hosted runners are on the internet with changing IPs, so this account is protected by **identity instead of network**: keys off, no anonymous access, Entra ID + RBAC. Production answer: self-hosted or VNet-injected runners + a private endpoint.
+  - CKV_AZURE_206 (geo-replication): skipped. Tiny lab state in the same region as the resources it tracks; versioning, soft delete and `prevent_destroy` cover the likely risks.
+  - **CKV_AZURE_249 = false positive.** I read the rule's Python source: its `owner/repo` regex doesn't allow `@`, so it rejects GitHub's new ID-based subject. Scanners lag behind platforms. When a finding looks wrong, read the rule, and say *why* in the skip reason.
+- **WORM is wrong for state:** every apply overwrites the state blob, and an immutability policy would make that fail with 409. Pick controls by how the data is used.
+- **Costs:** Entra objects and RBAC are free; the state account costs cents a month; GitHub Actions are free for public repos. The VM in the main config is the real cost, so I keep destroying it.
+
+### Mistakes I made & how I fixed them
+- Copied `.storage` into the bootstrap container reference → `validate`: "undeclared resource" → `azurerm_storage_account.tfstate.id`.
+- Account name `sttfstate-<random>`: hyphens aren't allowed → removed the hyphen.
+- Copied skip reasons from the main account ("I use IP rules", "destroyed each session"), which were false for this account → rewrote them.
+- `use_azure_auth` → `use_azuread_auth`. Argument names must match the docs exactly.
+- HCL quoting:
+  - display names need quotes;
+  - `audiences = "[...]"` → `["..."]` (lists have no outer quotes).
+- Used `.id` where `.client_id` was needed (service principal, output).
+- Provider typo `azureread` in `versions.tf`.
+- `"/subcriptions/..."`: `validate` can't catch typos inside strings, and it would only fail at apply. Read built-by-hand IDs character by character, or reference an attribute instead.
+- Ran `git add bootstrap` from inside `bootstrap/` → "pathspec did not match". Paths are relative to where I stand.
+- **PR #1 wasn't really merged** (missed "Confirm merge"), so `stage-9b` was built on old `main` without 9a. Fixed: confirmed the merge, then `git checkout main` → `git pull` → `git checkout stage-9b` → `git merge main` → `git push`. Always check for the purple **Merged** badge.
+- Thought I'd deleted `backend.tf`: I was on `main`, and the file only existed on `stage-9b`. Switching branches swaps the files. Check with `git branch --show-current`.
+- First OIDC run: `AADSTS700213: No matching federated identity record`. My subject used the old name-only format. Copied the exact subject from the error into the credential. Login errors usually show the exact value they received.
+- Bootstrap steps pasted into the `plan` job instead of job 1 → moved them, and fixed the indentation.
+
+### Break-fix challenge (CI identity loses its state role)
+- **Change:** commented out `github_state` (Blob Data Contributor on the container) and applied in `bootstrap/`. Re-ran the PR jobs without pushing, because the break was in Azure, not in the code.
+- **Prediction:** 403 at plan. ✅ Status correct.
+- **Run 1:** init passed, and it failed at **"Acquiring state lock"** with 403 `...not authorized to perform this operation using this permission`.
+- **Run 2** (a few minutes later): failed earlier, at **init**: `listing blobs ... 403 AuthorizationPermissionMismatch`.
+- **Why they differed:** **RBAC propagation**. Removing (and adding) a role takes minutes to take full effect. In run 1 the list call still worked for a few seconds.
+- **Layers:** the login worked (no 401/AADSTS) and Reader still worked; only the **data plane** was refused. Authenticated, but not authorized, same as Stage 7.
+- **Side effect, a stuck lock:** after restoring the role, plan failed with `state blob is already locked, blob metadata "terraformlockid" was empty`.
+  - In run 1, the **lease** (lock step 1) was taken before the 403 hit the **metadata** write (lock step 2). The infinite lease was never released.
+  - `terraform force-unlock` needs a lock ID, and there wasn't one.
+  - So I confirmed no run was active, then ran `az storage blob lease break ... --auth-mode login`. Both jobs green again.
+- **Lessons:**
+  - Wait a few minutes after RBAC changes before trusting a test, and re-test.
+  - For stuck locks, try `force-unlock <id>` first, else break the blob lease, but **only** when nothing is running.
+  - Temporary experiments don't get committed: after restoring, `git status` was clean.
